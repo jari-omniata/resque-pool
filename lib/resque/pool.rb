@@ -4,7 +4,6 @@ require 'resque/worker'
 require 'resque/pool/version'
 require 'resque/pool/logging'
 require 'resque/pool/pooled_worker'
-require 'resque/pool/file_or_hash_loader'
 require 'erb'
 require 'fcntl'
 require 'yaml'
@@ -12,18 +11,17 @@ require 'yaml'
 module Resque
   class Pool
     SIG_QUEUE_MAX_SIZE = 5
-    DEFAULT_WORKER_INTERVAL = 5
     QUEUE_SIGS = [ :QUIT, :INT, :TERM, :USR1, :USR2, :CONT, :HUP, :WINCH, ]
     CHUNK_SIZE = (16 * 1024)
 
     include Logging
     extend  Logging
     attr_reader :config
-    attr_reader :config_loader
     attr_reader :workers
+    attr_reader :options  
 
-    def initialize(config_loader=nil)
-      init_config(config_loader)
+    def initialize(config)
+      init_config(config) 
       @workers = Hash.new { |workers, queues| workers[queues] = {} }
       procline "(initialized)"
     end
@@ -33,7 +31,7 @@ module Resque
     # The `after_prefork` hooks will be run in workers if you are using the
     # preforking master worker to save memory. Use these hooks to reload
     # database connections and so forth to ensure that they're not shared
-    # among workers. The worker instance is passed as an argument to the block.
+    # among workers.
     #
     # Call with a block to set a hook.
     # Call with no arguments to return all registered hooks.
@@ -51,16 +49,17 @@ module Resque
       @after_prefork = [after_prefork]
     end
 
-    def call_after_prefork!(worker)
+    def call_after_prefork!
       self.class.after_prefork.each do |hook|
-        hook.call(worker)
+        hook.call
       end
     end
 
     # }}}
-    # Config: class methods to start up the pool using the config loader {{{
+    # Config: class methods to start up the pool using the default config {{{
 
-    class << self; attr_accessor :config_loader, :app_name, :spawn_delay; end
+    @config_files = ["resque-pool.yml", "config/resque-pool.yml"]
+    class << self; attr_accessor :config_files, :app_name, :spawn_delay; end
 
     def self.app_name
       @app_name ||= File.basename(Dir.pwd)
@@ -82,37 +81,46 @@ module Resque
       )
     end
 
+    def self.choose_config_file
+      if ENV["RESQUE_POOL_CONFIG"]
+        ENV["RESQUE_POOL_CONFIG"]
+      else
+        @config_files.detect { |f| File.exist?(f) }
+      end
+    end
+
     def self.run
       if GC.respond_to?(:copy_on_write_friendly=)
         GC.copy_on_write_friendly = true
       end
-      create_configured.start.join
-    end
-
-    def self.create_configured
-      Resque::Pool.new(config_loader)
+      Resque::Pool.new(choose_config_file).start.join
     end
 
     # }}}
-    # Config: store loader and load config {{{
+    # Config: load config and config file {{{
 
-    def init_config(loader)
-      case loader
-      when String, Hash, nil
-        @config_loader = FileOrHashLoader.new(loader)
+    def config_file
+      @config_file || (!@config && ::Resque::Pool.choose_config_file)
+    end
+
+    def init_config(config)
+      case config
+      when String, nil
+        @config_file = config
       else
-        @config_loader = loader
+        @config = config.dup
       end
       load_config
     end
 
     def load_config
-      @config = config_loader.call(environment)
-    end
-
-    def reset_config
-      config_loader.reset! if config_loader.respond_to?(:reset!)
-      load_config
+      if config_file
+        @config = YAML.load(ERB.new(IO.read(config_file)).result)
+      else
+        @config ||= {}
+      end
+      environment and @config[environment] and config.merge!(@config[environment])
+      config.delete_if {|key, value| value.is_a? Hash }
     end
 
     def environment
@@ -181,8 +189,8 @@ module Resque
         log "#{signal}: sending to all workers"
         signal_all_workers(signal)
       when :HUP
-        log "HUP: reset configuration and reload logfiles"
-        reset_config
+        log "HUP: reload config file and reload logfiles"
+        load_config
         Logging.reopen_logs!
         log "HUP: gracefully shutdown old children (which have old logfiles open)"
         if term_child
@@ -258,6 +266,8 @@ module Resque
 
     def start
       procline("(starting)")
+# XXX @options
+@options = { :worker_options => { :fork_per_job => false } }
       init_self_pipe!
       init_sig_handlers!
       maintain_worker_count
@@ -281,7 +291,6 @@ module Resque
         break if handle_sig_queue! == :break
         if sig_queue.empty?
           master_sleep
-          load_config
           maintain_worker_count
         end
         procline("managing #{all_pids.inspect}")
@@ -347,10 +356,12 @@ module Resque
     # ???: maintain_worker_count, all_known_queues {{{
 
     def maintain_worker_count
+      worker_options = @options[:worker_options] if @options[:worker_options]
+      worker_options = {} unless @options[:worker_options]
       all_known_queues.each do |queues|
         delta = worker_delta_for(queues)
-        spawn_missing_workers_for(queues) if delta > 0
-        quit_excess_workers_for(queues)   if delta < 0
+        spawn_missing_workers_for(queues, worker_options) if delta > 0
+        quit_excess_workers_for(queues, worker_options)   if delta < 0
       end
     end
 
@@ -362,9 +373,9 @@ module Resque
     # methods that operate on a single grouping of queues {{{
     # perhaps this means a class is waiting to be extracted
 
-    def spawn_missing_workers_for(queues)
+    def spawn_missing_workers_for(queues, worker_options)
       worker_delta_for(queues).times do |nr|
-        spawn_worker!(queues)
+        spawn_worker!(queues, worker_options)
         sleep Resque::Pool.spawn_delay if Resque::Pool.spawn_delay
       end
     end
@@ -384,26 +395,24 @@ module Resque
       workers[queues].keys
     end
 
-    def spawn_worker!(queues)
-      worker = create_worker(queues)
+    def spawn_worker!(queues, worker_options)
+      worker = create_worker(queues, worker_options)
       pid = fork do
         Process.setpgrp unless Resque::Pool.single_process_group
         worker.worker_parent_pid = Process.pid
         log_worker "Starting worker #{worker}"
-        call_after_prefork!(worker)
+        call_after_prefork!
         reset_sig_handlers!
         #self_pipe.each {|io| io.close }
-        worker.work(ENV['INTERVAL'] || DEFAULT_WORKER_INTERVAL) # interval, will block
+        worker.work()
       end
       workers[queues][pid] = worker
     end
 
-    def create_worker(queues)
+    def create_worker(queues, worker_options)
       queues = queues.to_s.split(',')
-      worker = ::Resque::Worker.new(*queues)
+      worker = ::Resque::Worker.new(*queues, worker_options)
       worker.pool_master_pid = Process.pid
-      worker.term_timeout = ENV['RESQUE_TERM_TIMEOUT'] || 4.0
-      worker.term_child = ENV['TERM_CHILD']
       if worker.respond_to?(:run_at_exit_hooks=)
         # resque doesn't support this until 1.24, but we support 1.22
         worker.run_at_exit_hooks = ENV['RUN_AT_EXIT_HOOKS'] || false
