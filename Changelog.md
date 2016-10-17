@@ -1,5 +1,26 @@
-## 0.6.0 _(unreleased)_
+## 0.7.0 _unreleased_
+[full changelog](https://github.com/nevans/resque-pool/compare/v0.6.0...master).
 
+One big new feature: `--hot-swap` for [zero-downtime code
+deploys](https://github.com/nevans/resque-pool#zero-downtime-code-deploys).
+Thanks to [joshuaflanagan](https://github.com/joshuaflanagan),
+[brasic](https://github.com/brasic), and
+[ShippingEasy](https://github.com/ShippingEasy)!
+
+## 0.6.0
+[full changelog](https://github.com/nevans/resque-pool/compare/v0.5.0...v0.6.0).
+
+One big new feature: [Custom Config
+Loader](https://github.com/nevans/resque-pool#custom-configuration-loader)
+thanks to [joshuaflanagan](https://github.com/joshuaflanagan)!
+
+Lots of cleanup in this release.  Thanks to the contributers:
+
+ * [joshuaflanagan](https://github.com/joshuaflanagan) Custom config loader
+ * [grosser](https://github.com/grosser)
+   * ship less files in the gem
+   * remove trollop dependency
+   * remove -n -t -r -n -i commandline options since they were added unintentionally
  * no longer hijacks shutdown for normal resque worker processes.
  * [PatrickTulskie](https://github.com/PatrickTulskie) Reopening log files now
    reopens *all* logs in memory (append write only; code copied from Unicorn)
