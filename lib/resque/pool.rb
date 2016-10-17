@@ -434,7 +434,7 @@ module Resque
 
     def create_worker(queues, worker_options)
       queues = queues.to_s.split(',')
-      worker = ::Resque::Worker.new(*queues, worker_options)
+      worker = ::Resque::Worker.new(queues, worker_options)
       worker.pool_master_pid = Process.pid
       if worker.respond_to?(:run_at_exit_hooks=)
         # resque doesn't support this until 1.24, but we support 1.22
